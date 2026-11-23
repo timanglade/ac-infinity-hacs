@@ -1,23 +1,34 @@
 """Local Cloudcom 6 support layered on the pinned ac-infinity-ble 1.0.0.
 
 The Cloudcom 6 advertises device type 64 at protocol version 20, which
-ac-infinity-ble 1.0.0 rejects as unsupported. It is a read-only sensor, but
-unlike older Cloudcom models its advertisement carries no readings: the
-temperature/humidity bytes stay zero. Readings only arrive as GATT telemetry,
-which it streams about once a second as soon as a client subscribes to the
-notify characteristic; no command is needed.
+ac-infinity-ble 1.0.0 rejects as unsupported. Unlike older Cloudcom models its
+advertisement carries no readings: the temperature/humidity bytes stay zero.
+Readings and port state arrive only as GATT telemetry, which it streams about
+once a second as soon as a client subscribes to the notify characteristic.
 
 Telemetry is a ``1e ff 02 09`` frame with a two-byte length at offset 5 (like
-the AI 2 family). Byte 12 is the number of sensor groups, which start at byte
-27. Each group is ``kind, index, count`` followed by ``count`` four-byte records
-``id, flags, int16``. Index 0 is the unit's built-in sensor; an external probe
-adds a group (seen as kind 6, index 1). Record IDs and accuracy flags use the
-library's existing AI conventions (0/1 temperature F/C, 2 humidity, 3 VPD).
-Captured from one unit, software revision 1.0.49, with a probe attached:
+the AI 2 family). Byte 11 is the number of port records and byte 12 the number
+of sensor groups. Port records start at byte 15 and are 12 bytes each:
+``id, raw_type(2), load_id(2), kind, level/fault, ...`` using the AI family's
+field meanings; port 0 is the unit itself. The configured mode only comes from
+GET (tag 16); see ``_decode_port``. Sensor groups follow: each
+is ``kind, index, count`` then ``count`` four-byte records ``id, flags, int16``.
+Group index 0 is the built-in sensor; an external probe adds a group (seen as
+kind 6, index 1). Record IDs and accuracy flags follow the library's AI
+conventions (0/1 temperature F/C, 2 humidity, 3 VPD). Captured from one unit,
+software revision 1.0.49, with a fan on port 1 and a probe attached:
 
-    1eff0209 1400 32 1080000001 02 0000 00000000ffff00000001f00000
-    0000 03 00601b07 02601ad5 0360004c  ->  69.19 F, 68.69 %, 0.76 kPa
-    0601 03 00601aae 0260161c 03600067  ->  68.30 F, 56.60 %, 1.03 kPa
+    1eff0209 1400 3e 1080000002 02 0100
+    00 0000 ffff 00 00 00 01f00000         port 0 (unit, no load)
+    01 13cd ffff 00 00 02 01fc4803         port 1: 5069 ohm -> fan, level 0
+    0000 03 00611b58 02621acc 0366004f     built-in 70.00 F, 68.60 %, 0.79 kPa
+    0601 03 00601ac2 02601630 03600067     probe    68.50 F, 56.80 %, 1.03 kPa
+
+Commands use the AI 2 parameter codec (addressed ports, two-byte parameter
+lengths, manual speed in the upper nibble of tag 18). Replies carry the
+protocol version in the high byte of the command word (``14 01`` for a GET),
+which the library's exact two-byte match rejects; ``Cloudcom6Protocol``
+matches the low byte only.
 
 This belongs upstream in ac-infinity-ble. Until then, ``install()`` patches the
 library narrowly: every hook defers to the original unless the type is 64.
@@ -25,32 +36,36 @@ library narrowly: every hook defers to the original unless the type is 64.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, fields, replace
 
 from ac_infinity_ble import device as _device
 from ac_infinity_ble import models as _models
 from ac_infinity_ble import protocol as _protocol
+from ac_infinity_ble.capabilities import load_kind, recognized_kind
 from ac_infinity_ble.const import MANUFACTURER_ID
-from ac_infinity_ble.models import DeviceInfo
+from ac_infinity_ble.exceptions import FrameValidationError
+from ac_infinity_ble.models import DeviceInfo, PortState
+from ac_infinity_ble.protocol import Protocol
 from ac_infinity_ble.routing import ProtocolProfile, TelemetryLayout
 
 CLOUDCOM6_TYPE = 64
 MODEL_NAME = "Cloudcom 6"
 TELEMETRY_HEADER = b"\x1e\xff\x02\x09"
+PORTS_OFFSET = 15
+PORT_RECORD_SIZE = 12
 SENSOR_RECORD_SIZE = 4
-_GROUPS_OFFSET = 27
-_TELEMETRY_TIMEOUT = 5
 _READING_KEYS = {0: "tmp", 1: "tmp", 2: "hum", 3: "vpd"}
 
 PROFILE = ProtocolProfile(
     model_name=MODEL_NAME,
-    # Closest existing layout: read-only, no ports, no output entities.
-    telemetry=TelemetryLayout.SENSOR,
-    addressed=False,
+    # Matches the library's Controller AI 2 command profile, minus the
+    # aggregate fan: port 0 is the unit itself, loads are on numbered ports.
+    telemetry=TelemetryLayout.H4,
+    addressed=True,
     parameter_length_size=2,
-    writable=False,
+    writable=True,
     aggregate_fan=False,
+    packed_manual_level=True,
 )
 
 
@@ -72,6 +87,21 @@ class Cloudcom6Info(DeviceInfo):
     probes: tuple[ProbeReading, ...] = ()
 
 
+class Cloudcom6Protocol(Protocol):
+    """Accept replies whose command word carries the protocol version."""
+
+    def parse_response(
+        self,
+        data: bytes | bytearray,
+        expected_sequence: int | None = None,
+        expected_command: int | None = None,
+    ) -> bytes:
+        payload = super().parse_response(data, expected_sequence)
+        if expected_command is not None and data[9] != expected_command:
+            raise FrameValidationError("Unexpected response command")
+        return payload
+
+
 def is_cloudcom6(state: DeviceInfo) -> bool:
     return state.type == CLOUDCOM6_TYPE
 
@@ -79,11 +109,6 @@ def is_cloudcom6(state: DeviceInfo) -> bool:
 def probes(state: DeviceInfo) -> tuple[ProbeReading, ...]:
     """External probes present in the latest telemetry (empty for other models)."""
     return getattr(state, "probes", ())
-
-
-def streams_telemetry(state: DeviceInfo) -> bool:
-    """Whether readings require a GATT connection instead of advertisements."""
-    return state.profile.writable or is_cloudcom6(state)
 
 
 def parse_advertisement(data: bytes) -> DeviceInfo:
@@ -113,11 +138,18 @@ def telemetry_frame_length(data: bytes | bytearray) -> int | None:
 def parse_telemetry(data: bytes | bytearray, state: DeviceInfo) -> DeviceInfo:
     if data[:4] != TELEMETRY_HEADER or len(data) != telemetry_frame_length(data):
         raise ValueError("Invalid Cloudcom 6 telemetry framing")
-    if len(data) < _GROUPS_OFFSET:
+    if len(data) < PORTS_OFFSET:
         raise ValueError("Truncated Cloudcom 6 telemetry")
+    offset = PORTS_OFFSET
+    ports: dict[int, PortState] = {}
+    for _ in range(data[11]):
+        record = data[offset : offset + PORT_RECORD_SIZE]
+        if len(record) != PORT_RECORD_SIZE or record[0] in ports:
+            raise ValueError("Invalid Cloudcom 6 port records")
+        ports[record[0]] = _decode_port(record, state.ports.get(record[0]))
+        offset += PORT_RECORD_SIZE
     builtin = {"tmp": None, "hum": None, "vpd": None}
     found: list[ProbeReading] = []
-    offset = _GROUPS_OFFSET
     for _ in range(data[12]):
         if offset + 3 > len(data):
             raise ValueError("Invalid Cloudcom 6 sensor groups")
@@ -138,7 +170,28 @@ def parse_telemetry(data: bytes | bytearray, state: DeviceInfo) -> DeviceInfo:
         raise ValueError("Invalid Cloudcom 6 sensor groups")
     if not isinstance(state, Cloudcom6Info):
         state = Cloudcom6Info(**{f.name: getattr(state, f.name) for f in fields(state)})
-    return replace(state, **builtin, probes=tuple(found))
+    return replace(state, **builtin, probes=tuple(found), ports=ports)
+
+
+def _decode_port(record: bytes | bytearray, previous: PortState | None) -> PortState:
+    raw_type = int.from_bytes(record[1:3], "big")
+    load_id = int.from_bytes(record[3:5], "big")
+    kind = load_kind(record[5]) or recognized_kind(raw_type, load_id)
+    # Byte 7 is not the configured mode: it read 02 for a fan both in Cycle and
+    # in Off. Keep the mode last read by GET (or confirmed by SET) for this load.
+    same_load = previous is not None and (previous.kind, previous.raw_type) == (
+        kind,
+        raw_type,
+    )
+    return PortState(
+        record[0],
+        connected=record[1] != 255,
+        raw_type=raw_type,
+        kind=kind,
+        level=(record[6] >> 2) & 15,
+        mode=previous.mode if same_load else None,
+        fault=bool(record[6] & 1),
+    )
 
 
 def _decode_records(block: bytes | bytearray) -> dict[str, float | None]:
@@ -163,8 +216,8 @@ def install() -> None:
     original_frame_length = _device.telemetry_frame_length
     original_parse_telemetry = _device.parse_telemetry
     controller = _device.ACInfinityController
+    original_init = controller.__init__
     original_set_adv = controller.set_ble_device_and_advertisement_data
-    original_refresh = controller.refresh_telemetry
 
     def resolve_profile(device_type: int, version: int) -> ProtocolProfile:
         if device_type == CLOUDCOM6_TYPE:
@@ -181,6 +234,11 @@ def install() -> None:
             return parse_telemetry(data, state)
         return original_parse_telemetry(data, state)
 
+    def __init__(self, *args, **kwargs) -> None:
+        original_init(self, *args, **kwargs)
+        if is_cloudcom6(self._state):
+            self._protocol = Cloudcom6Protocol()
+
     def set_ble_device_and_advertisement_data(self, ble_device, advertisement_data):
         if not is_cloudcom6(self._state):
             return original_set_adv(self, ble_device, advertisement_data)
@@ -189,34 +247,16 @@ def install() -> None:
         info = parse_advertisement(
             advertisement_data.manufacturer_data[MANUFACTURER_ID]
         )
-        # Keep telemetry readings; only identity comes from advertisements.
+        # Keep telemetry readings and ports; advertisements carry identity only.
         self._state = replace(self._state, name=info.name, version=info.version)
         self._fire_callbacks(_device.CallbackType.ADVERTISEMENT)
-
-    async def refresh_telemetry(self) -> None:
-        if not is_cloudcom6(self._state):
-            return await original_refresh(self)
-        # Same as the library's writable-device path, which 1.0.0 gates on
-        # profile.writable: connect, subscribe, wait for one frame.
-        async with self._operation_lock:
-            self._telemetry_event.clear()
-            try:
-                await self._ensure_connected()
-                async with asyncio.timeout(_TELEMETRY_TIMEOUT):
-                    await self._telemetry_event.wait()
-            except BaseException:
-                await self._execute_disconnect()
-                raise
-            finally:
-                if self._client and self._client.is_connected:
-                    self._reset_disconnect_timer()
 
     _models.resolve_profile = resolve_profile
     _device.parse_manufacturer_data = parse_manufacturer_data  # controller __init__
     _device.telemetry_frame_length = frame_length
     _device.parse_telemetry = parse
+    controller.__init__ = __init__
     controller.set_ble_device_and_advertisement_data = (
         set_ble_device_and_advertisement_data
     )
-    controller.refresh_telemetry = refresh_telemetry
     _device._cloudcom6_installed = True
