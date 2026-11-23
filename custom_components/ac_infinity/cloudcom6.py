@@ -8,13 +8,16 @@ which it streams about once a second as soon as a client subscribes to the
 notify characteristic; no command is needed.
 
 Telemetry is a ``1e ff 02 09`` frame with a two-byte length at offset 5 (like
-the AI 2 family). Its tail is a sensor block: a count byte followed by four-byte
-records ``id, flags, int16``. IDs and accuracy flags use the library's existing
-AI conventions (0/1 temperature F/C, 2 humidity, 3 VPD). Captured from one unit,
-software revision 1.0.49:
+the AI 2 family). Byte 12 is the number of sensor groups, which start at byte
+27. Each group is ``kind, index, count`` followed by ``count`` four-byte records
+``id, flags, int16``. Index 0 is the unit's built-in sensor; an external probe
+adds a group (seen as kind 6, index 1). Record IDs and accuracy flags use the
+library's existing AI conventions (0/1 temperature F/C, 2 humidity, 3 VPD).
+Captured from one unit, software revision 1.0.49, with a probe attached:
 
-    1eff0209 1400 23 1080000001010000 00000000ffff00000001f0 000000
-    03 00601afe 02601aea 0360004b  ->  69.10 F (20.6 C), 68.90 %, 0.75 kPa
+    1eff0209 1400 32 1080000001 02 0000 00000000ffff00000001f00000
+    0000 03 00601b07 02601ad5 0360004c  ->  69.19 F, 68.69 %, 0.76 kPa
+    0601 03 00601aae 0260161c 03600067  ->  68.30 F, 56.60 %, 1.03 kPa
 
 This belongs upstream in ac-infinity-ble. Until then, ``install()`` patches the
 library narrowly: every hook defers to the original unless the type is 64.
@@ -23,7 +26,7 @@ library narrowly: every hook defers to the original unless the type is 64.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 
 from ac_infinity_ble import device as _device
 from ac_infinity_ble import models as _models
@@ -36,10 +39,9 @@ CLOUDCOM6_TYPE = 64
 MODEL_NAME = "Cloudcom 6"
 TELEMETRY_HEADER = b"\x1e\xff\x02\x09"
 SENSOR_RECORD_SIZE = 4
-# Header (15) + one 11-byte port record + 3 unknown bytes precede the count.
-_SENSOR_BLOCK_FIXED = 15 + 3
-_PORT_RECORD_SIZE = 11
+_GROUPS_OFFSET = 27
 _TELEMETRY_TIMEOUT = 5
+_READING_KEYS = {0: "tmp", 1: "tmp", 2: "hum", 3: "vpd"}
 
 PROFILE = ProtocolProfile(
     model_name=MODEL_NAME,
@@ -52,8 +54,31 @@ PROFILE = ProtocolProfile(
 )
 
 
+@dataclass(frozen=True)
+class ProbeReading:
+    """One external probe's readings, keyed by its group index."""
+
+    index: int
+    kind: int
+    tmp: float | None = None
+    hum: float | None = None
+    vpd: float | None = None
+
+
+@dataclass(frozen=True)
+class Cloudcom6Info(DeviceInfo):
+    """DeviceInfo plus external probes; library replace() calls preserve it."""
+
+    probes: tuple[ProbeReading, ...] = ()
+
+
 def is_cloudcom6(state: DeviceInfo) -> bool:
     return state.type == CLOUDCOM6_TYPE
+
+
+def probes(state: DeviceInfo) -> tuple[ProbeReading, ...]:
+    """External probes present in the latest telemetry (empty for other models)."""
+    return getattr(state, "probes", ())
 
 
 def streams_telemetry(state: DeviceInfo) -> bool:
@@ -88,25 +113,45 @@ def telemetry_frame_length(data: bytes | bytearray) -> int | None:
 def parse_telemetry(data: bytes | bytearray, state: DeviceInfo) -> DeviceInfo:
     if data[:4] != TELEMETRY_HEADER or len(data) != telemetry_frame_length(data):
         raise ValueError("Invalid Cloudcom 6 telemetry framing")
-    if len(data) < _SENSOR_BLOCK_FIXED + 1:
+    if len(data) < _GROUPS_OFFSET:
         raise ValueError("Truncated Cloudcom 6 telemetry")
-    offset = _SENSOR_BLOCK_FIXED + data[12] * _PORT_RECORD_SIZE
-    if offset >= len(data):
-        raise ValueError("Truncated Cloudcom 6 telemetry")
-    count = data[offset]
-    offset += 1
-    if offset + count * SENSOR_RECORD_SIZE != len(data):
-        raise ValueError("Invalid Cloudcom 6 sensor count")
+    builtin = {"tmp": None, "hum": None, "vpd": None}
+    found: list[ProbeReading] = []
+    offset = _GROUPS_OFFSET
+    for _ in range(data[12]):
+        if offset + 3 > len(data):
+            raise ValueError("Invalid Cloudcom 6 sensor groups")
+        kind, index, count = data[offset : offset + 3]
+        offset += 3
+        end = offset + count * SENSOR_RECORD_SIZE
+        if end > len(data):
+            raise ValueError("Invalid Cloudcom 6 sensor count")
+        readings = _decode_records(data[offset:end])
+        offset = end
+        if index == 0:
+            builtin.update(readings)
+        elif any(p.index == index for p in found):
+            raise ValueError("Duplicate Cloudcom 6 probe")
+        else:
+            found.append(ProbeReading(index, kind, **readings))
+    if offset != len(data):
+        raise ValueError("Invalid Cloudcom 6 sensor groups")
+    if not isinstance(state, Cloudcom6Info):
+        state = Cloudcom6Info(**{f.name: getattr(state, f.name) for f in fields(state)})
+    return replace(state, **builtin, probes=tuple(found))
+
+
+def _decode_records(block: bytes | bytearray) -> dict[str, float | None]:
     readings: dict[str, float | None] = {}
-    for start in range(offset, len(data), SENSOR_RECORD_SIZE):
-        sensor_id, flags = data[start], data[start + 1]
-        raw = int.from_bytes(data[start + 2 : start + 4], "big", signed=True)
+    for start in range(0, len(block), SENSOR_RECORD_SIZE):
+        sensor_id, flags = block[start], block[start + 1]
+        raw = int.from_bytes(block[start + 2 : start + 4], "big", signed=True)
         value = None if raw == -32768 else raw * (10, 1, 0.1, 0.01)[(flags >> 5) & 3]
         if sensor_id == 0 and value is not None:
             value = (value - 32) / 1.8
-        if (key := {0: "tmp", 1: "tmp", 2: "hum", 3: "vpd"}.get(sensor_id)) is not None:
+        if (key := _READING_KEYS.get(sensor_id)) is not None:
             readings[key] = None if value is None else round(value, 2)
-    return replace(state, **readings)
+    return readings
 
 
 def install() -> None:
