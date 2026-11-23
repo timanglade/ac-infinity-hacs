@@ -8,7 +8,6 @@ from typing import Any
 import voluptuous as vol
 from ac_infinity_ble import ACInfinityController
 from ac_infinity_ble.const import MANUFACTURER_ID
-from ac_infinity_ble.protocol import parse_manufacturer_data
 from homeassistant import config_entries
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
@@ -17,6 +16,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA
 from homeassistant.data_entry_flow import FlowResult
 
+from .cloudcom6 import parse_manufacturer_data
 from .const import BLEAK_EXCEPTIONS, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)

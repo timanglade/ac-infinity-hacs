@@ -17,6 +17,8 @@ from homeassistant.components.bluetooth.active_update_coordinator import (
 )
 from homeassistant.core import CoreState, HomeAssistant, callback
 
+from .cloudcom6 import streams_telemetry
+
 DEVICE_STARTUP_TIMEOUT = 30
 PORT_FRESHNESS = 30
 SETTINGS_FRESHNESS = 300
@@ -94,7 +96,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # and we actually have a way to connect to the device
         return (
             not self._shutting_down
-            and self.controller.state.profile.writable
+            and streams_telemetry(self.controller.state)
             and self.hass.state == CoreState.running
             and monotonic() >= self._next_poll
             and (

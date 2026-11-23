@@ -16,6 +16,7 @@ from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 
+from .cloudcom6 import install as install_cloudcom6
 from .coordinator import ACInfinityDataUpdateCoordinator
 from .metadata import controller_device_info
 from .models import ACInfinityConfigEntry, ACInfinityData
@@ -29,6 +30,8 @@ PLATFORMS: list[Platform] = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+install_cloudcom6()
 
 
 async def async_migrate_entry(
