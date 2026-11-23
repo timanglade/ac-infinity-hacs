@@ -27,8 +27,8 @@ software revision 1.0.49, with a fan on port 1 and a probe attached:
 Commands use the AI 2 parameter codec (addressed ports, two-byte parameter
 lengths, manual speed in the upper nibble of tag 18). Replies carry the
 protocol version in the high byte of the command word (``14 01`` for a GET),
-which the library's exact two-byte match rejects; ``Cloudcom6Protocol``
-matches the low byte only.
+which the library's ``00 01`` match rejects; ``Cloudcom6Protocol`` expects the
+unit's advertised version there instead.
 
 This belongs upstream in ac-infinity-ble. Until then, ``install()`` patches the
 library narrowly: every hook defers to the original unless the type is 64.
@@ -47,6 +47,7 @@ from ac_infinity_ble.exceptions import FrameValidationError
 from ac_infinity_ble.models import DeviceInfo, PortState
 from ac_infinity_ble.protocol import Protocol
 from ac_infinity_ble.routing import ProtocolProfile, TelemetryLayout
+from ac_infinity_ble.telemetry import frame_length
 
 CLOUDCOM6_TYPE = 64
 MODEL_NAME = "Cloudcom 6"
@@ -88,7 +89,11 @@ class Cloudcom6Info(DeviceInfo):
 
 
 class Cloudcom6Protocol(Protocol):
-    """Accept replies whose command word carries the protocol version."""
+    """Expect replies whose command word carries the protocol version."""
+
+    def __init__(self, version: int) -> None:
+        super().__init__()
+        self.version = version
 
     def parse_response(
         self,
@@ -97,7 +102,9 @@ class Cloudcom6Protocol(Protocol):
         expected_command: int | None = None,
     ) -> bytes:
         payload = super().parse_response(data, expected_sequence)
-        if expected_command is not None and data[9] != expected_command:
+        if expected_command is not None and data[8:10] != bytes(
+            (self.version, expected_command)
+        ):
             raise FrameValidationError("Unexpected response command")
         return payload
 
@@ -129,14 +136,9 @@ def parse_manufacturer_data(data: bytes) -> DeviceInfo:
     return _protocol.parse_manufacturer_data(data)
 
 
-def telemetry_frame_length(data: bytes | bytearray) -> int | None:
-    if len(data) < 7:
-        return None
-    return 7 + int.from_bytes(data[5:7], "big")
-
-
 def parse_telemetry(data: bytes | bytearray, state: DeviceInfo) -> DeviceInfo:
-    if data[:4] != TELEMETRY_HEADER or len(data) != telemetry_frame_length(data):
+    # The library's frame_length already covers this two-byte length header.
+    if data[:4] != TELEMETRY_HEADER or len(data) != frame_length(data, state):
         raise ValueError("Invalid Cloudcom 6 telemetry framing")
     if len(data) < PORTS_OFFSET:
         raise ValueError("Truncated Cloudcom 6 telemetry")
@@ -150,10 +152,14 @@ def parse_telemetry(data: bytes | bytearray, state: DeviceInfo) -> DeviceInfo:
         offset += PORT_RECORD_SIZE
     builtin = {"tmp": None, "hum": None, "vpd": None}
     found: list[ProbeReading] = []
+    indexes: set[int] = set()
     for _ in range(data[12]):
         if offset + 3 > len(data):
             raise ValueError("Invalid Cloudcom 6 sensor groups")
         kind, index, count = data[offset : offset + 3]
+        if index in indexes:
+            raise ValueError("Duplicate Cloudcom 6 sensor group")
+        indexes.add(index)
         offset += 3
         end = offset + count * SENSOR_RECORD_SIZE
         if end > len(data):
@@ -162,8 +168,6 @@ def parse_telemetry(data: bytes | bytearray, state: DeviceInfo) -> DeviceInfo:
         offset = end
         if index == 0:
             builtin.update(readings)
-        elif any(p.index == index for p in found):
-            raise ValueError("Duplicate Cloudcom 6 probe")
         else:
             found.append(ProbeReading(index, kind, **readings))
     if offset != len(data):
@@ -213,7 +217,6 @@ def install() -> None:
         return
 
     original_profile = _models.resolve_profile
-    original_frame_length = _device.telemetry_frame_length
     original_parse_telemetry = _device.parse_telemetry
     controller = _device.ACInfinityController
     original_init = controller.__init__
@@ -224,11 +227,6 @@ def install() -> None:
             return PROFILE
         return original_profile(device_type, version)
 
-    def frame_length(data: bytes | bytearray, state: DeviceInfo) -> int | None:
-        if is_cloudcom6(state):
-            return telemetry_frame_length(data)
-        return original_frame_length(data, state)
-
     def parse(data: bytes | bytearray, state: DeviceInfo) -> DeviceInfo:
         if is_cloudcom6(state):
             return parse_telemetry(data, state)
@@ -237,7 +235,7 @@ def install() -> None:
     def __init__(self, *args, **kwargs) -> None:
         original_init(self, *args, **kwargs)
         if is_cloudcom6(self._state):
-            self._protocol = Cloudcom6Protocol()
+            self._protocol = Cloudcom6Protocol(self._state.version)
 
     def set_ble_device_and_advertisement_data(self, ble_device, advertisement_data):
         if not is_cloudcom6(self._state):
@@ -249,11 +247,11 @@ def install() -> None:
         )
         # Keep telemetry readings and ports; advertisements carry identity only.
         self._state = replace(self._state, name=info.name, version=info.version)
+        self._protocol.version = info.version
         self._fire_callbacks(_device.CallbackType.ADVERTISEMENT)
 
     _models.resolve_profile = resolve_profile
     _device.parse_manufacturer_data = parse_manufacturer_data  # controller __init__
-    _device.telemetry_frame_length = frame_length
     _device.parse_telemetry = parse
     controller.__init__ = __init__
     controller.set_ble_device_and_advertisement_data = (

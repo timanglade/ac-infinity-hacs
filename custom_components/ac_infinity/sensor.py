@@ -12,7 +12,7 @@ from homeassistant.const import PERCENTAGE, UnitOfPressure, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .cloudcom6 import ProbeReading, probes
+from .cloudcom6 import ProbeReading, is_cloudcom6, probes
 from .coordinator import ACInfinityDataUpdateCoordinator
 from .entity import ACInfinityEntity
 from .models import ACInfinityConfigEntry, ACInfinityData
@@ -32,6 +32,8 @@ async def async_setup_entry(
     if data.device.state.version >= 3:
         entities.append(VpdSensor(data.coordinator, data.device, entry.title))
     async_add_entities(entities)
+    if not is_cloudcom6(data.device.state):
+        return
 
     # Cloudcom 6 external probes appear in telemetry, possibly after setup.
     seen: set[int] = set()
@@ -68,6 +70,10 @@ class ACInfinitySensor(ACInfinityEntity, SensorEntity):
         self._device = device
         self._name = name
         self._async_update_attrs()
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.readings_available
 
     @callback
     def _async_update_attrs(self) -> None:

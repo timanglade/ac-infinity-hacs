@@ -111,7 +111,9 @@ def make_entry(model=11):
     )
     listeners = []
     coordinator = SimpleNamespace(
-        available=True, async_add_listener=lambda fn: listeners.append(fn)
+        available=True,
+        readings_available=True,
+        async_add_listener=lambda fn: listeners.append(fn),
     )
     return (
         SimpleNamespace(

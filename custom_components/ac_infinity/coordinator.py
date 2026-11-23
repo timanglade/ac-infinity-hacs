@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from datetime import datetime, timedelta
 from time import monotonic
 
 from ac_infinity_ble import ACInfinityController
@@ -16,11 +17,19 @@ from homeassistant.components.bluetooth.active_update_coordinator import (
     ActiveBluetoothDataUpdateCoordinator,
 )
 from homeassistant.core import CoreState, HomeAssistant, callback
+from homeassistant.helpers.event import async_track_time_interval
+
+from .cloudcom6 import is_cloudcom6
 
 DEVICE_STARTUP_TIMEOUT = 30
 PORT_FRESHNESS = 30
 SETTINGS_FRESHNESS = 300
 MAX_POLL_BACKOFF = 300
+# Cloudcom 6 advertisements never change, and HA only dispatches changed
+# advertisements, so its polls need their own clock.
+TELEMETRY_TICK = timedelta(seconds=10)
+# Its readings exist only in telemetry; older readings are not trustworthy.
+STALE_READINGS = 600
 
 
 class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]):
@@ -53,6 +62,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         self._next_poll = 0.0
         self._shutting_down = False
         self._poll_task: asyncio.Task | None = None
+        self._readings_were_available = False
         self._remove_controller_callback = controller.register_callback(
             self._controller_updated
         )
@@ -61,6 +71,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
     def _controller_updated(self, state: DeviceInfo, kind: CallbackType) -> None:
         if kind == CallbackType.NOTIFICATION:
             self._last_telemetry = monotonic()
+            self._readings_were_available = True  # published just below
             for port_id, (_, load_kind, raw_type) in list(self._settings_read.items()):
                 if port_id == 0:
                     continue
@@ -115,6 +126,10 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         """Refresh telemetry and, less often, the saved settings for each load."""
         if self._shutting_down:
             return
+        if is_cloudcom6(self.controller.state) and monotonic() < self._next_poll:
+            # A tick can queue a debounced call during a slow connect; if that
+            # poll fails, the queued call would otherwise run inside the backoff.
+            return
         self._poll_task = asyncio.current_task()
         try:
             # An initial GET opens the stream. Re-evaluate discovered ports afterward.
@@ -148,6 +163,36 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
                 port.kind if port else None,
                 port.raw_type if port else None,
             )
+
+    @property
+    def readings_available(self) -> bool:
+        """Whether sensor readings are current enough to report."""
+        if not is_cloudcom6(self.controller.state):
+            return True  # readings come from advertisements
+        return (
+            self._last_telemetry is not None
+            and monotonic() - self._last_telemetry < STALE_READINGS
+        )
+
+    @callback
+    def _async_start(self) -> None:
+        super()._async_start()
+        if is_cloudcom6(self.controller.state):
+            # Registered with the Bluetooth callbacks so every stop path cancels it.
+            self._on_stop.append(
+                async_track_time_interval(
+                    self.hass, self._async_telemetry_tick, TELEMETRY_TICK
+                )
+            )
+
+    @callback
+    def _async_telemetry_tick(self, _now: datetime) -> None:
+        """Poll as an unchanged advertisement would, and expire stale readings."""
+        if (info := self._last_service_info) is not None and self.needs_poll(info):
+            self._debounced_poll.async_schedule_call()
+        if (available := self.readings_available) != self._readings_were_available:
+            self._readings_were_available = available
+            self.async_update_listeners()
 
     async def async_shutdown(self) -> None:
         """Stop polling and release the BLE connection, including on reload."""

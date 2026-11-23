@@ -28,6 +28,7 @@ def integration(monkeypatch):
         "homeassistant.exceptions",
         "homeassistant.helpers",
         "homeassistant.helpers.device_registry",
+        "homeassistant.helpers.event",
     ]
     modules = {name: ModuleType(name) for name in module_names}
 
@@ -39,7 +40,11 @@ def integration(monkeypatch):
             self.hass = hass
             self.logger = logger
             self._async_stop = Mock()
+            self._on_stop = []
             self.listeners = []
+
+        def _async_start(self):
+            pass
 
         def async_add_listener(self, listener):
             self.listeners.append(listener)
@@ -82,6 +87,9 @@ def integration(monkeypatch):
     registry.CONNECTION_BLUETOOTH = "bluetooth"
     registry.DeviceInfo = dict
     registry.async_get = Mock(return_value=Mock())
+    modules["homeassistant.helpers.event"].async_track_time_interval = Mock(
+        return_value=Mock()
+    )
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     for name in list(sys.modules):

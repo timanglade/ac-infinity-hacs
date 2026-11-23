@@ -10,6 +10,7 @@ import pytest
 from ac_infinity_ble import ACInfinityController, CallbackType, DeviceInfo
 from ac_infinity_ble.const import MANUFACTURER_ID
 from ac_infinity_ble.protocol import Protocol
+from ac_infinity_ble.util import crc16
 from test_entities import entities, make_entry  # noqa: F401
 from test_lifecycle import integration  # noqa: F401
 from test_polling import setup_polling
@@ -35,6 +36,12 @@ FRAME_FAN = bytes.fromhex(
 )
 # GET tags 16-23 for port 1, sequence 10: the reply's command word is 14 01.
 GET_PORT1 = bytes.fromhex("a500000a000acab200011011121314151617ff01ff2b")
+# GET tags 16-23 for port 0 (the unit itself), sequence 12, as captured.
+GET_PORT0 = bytes.fromhex("a500000a000caa7400011011121314151617ff00ef0a")
+GET_PORT0_REPLY = bytes.fromhex(
+    "a51f0031000cfe8314011000010111000100120001 1a 13000014000400000000150004000000"
+    "00160008000000000000000017000400000000ff0089ce".replace(" ", "")
+)
 GET_PORT1_REPLY = bytes.fromhex(
     "a51f0031000a9e4514011000010211000100120001111300001400040000000015000400000000"
     "160008000000000000000017000400000000ff011976"
@@ -265,3 +272,161 @@ def test_get_reply_with_version_in_command_word_is_accepted(cc6):
             controller._protocol.parse_response(GET_PORT1_REPLY, 10, 3)
 
     asyncio.run(exercise())
+
+
+def answer(controller, request, reply, sequence):
+    """Feed a captured reply through the real notification path."""
+
+    async def send(command):
+        assert command == request
+        controller._pending_sequence, controller._pending_command = sequence, 1
+        controller._notify_future = asyncio.get_running_loop().create_future()
+        for start in range(0, len(reply), 20):
+            controller._notification_handler(None, bytearray(reply[start : start + 20]))
+        return bytes(await controller._notify_future)
+
+    controller._send_command = send
+    controller._sequence = sequence - 1
+
+
+def test_captured_port0_reply_satisfies_setup_and_polling_read(cc6):
+    async def exercise():
+        controller = make_controller()
+        answer(controller, GET_PORT0, GET_PORT0_REPLY, 12)
+        await controller.update(0)
+        port = controller.state.ports[0]
+        assert (port.mode, port.level_on, port.level_off) == (1, 1, 0)
+
+    asyncio.run(exercise())
+
+
+def with_body_crc(frame: bytes) -> bytes:
+    body = list(frame)
+    body[-2:] = crc16(body, 8, len(frame) - 10)
+    return bytes(body)
+
+
+def test_reply_must_carry_the_advertised_protocol_version(cc6):
+    async def exercise():
+        controller = make_controller()
+        other_version = with_body_crc(
+            GET_PORT1_REPLY[:8] + b"\x15" + GET_PORT1_REPLY[9:]
+        )
+        with pytest.raises(ValueError, match="command"):
+            controller._protocol.parse_response(other_version, 10, 1)
+        # A firmware update seen in advertisements moves the expectation along.
+        controller.set_ble_device_and_advertisement_data(
+            SimpleNamespace(address="AA:BB"),
+            SimpleNamespace(
+                manufacturer_data={MANUFACTURER_ID: ADV_27[:11] + b"\x15" + ADV_27[12:]}
+            ),
+        )
+        assert controller.state.version == 0x15
+        assert controller._protocol.parse_response(other_version, 10, 1)
+
+    asyncio.run(exercise())
+
+
+def test_duplicate_sensor_group_is_rejected_and_keeps_good_state(cc6):
+    async def exercise():
+        controller = make_controller()
+        controller._notification_handler(None, bytearray(FRAME_PROBE))
+        bad = bytearray(FRAME_PROBE)
+        bad[43] = 0  # probe group index 1 -> 0, duplicating the built-in group
+        with pytest.raises(ValueError, match="Duplicate"):
+            cc6.parse_telemetry(bad, controller.state)
+        controller._notification_handler(None, bad)
+        assert controller.humidity == pytest.approx(68.69)
+        assert len(cc6.probes(controller.state)) == 1
+
+    asyncio.run(exercise())
+
+
+def test_cloudcom6_polls_on_its_own_clock_and_expires_readings(
+    integration,  # noqa: F811
+    monkeypatch,
+):
+    module = importlib.import_module("custom_components.ac_infinity.coordinator")
+    coordinator, device, clock, service = setup_polling(integration, monkeypatch)
+    coordinator.hass = SimpleNamespace(state="running")
+    coordinator._last_service_info = None
+    coordinator._debounced_poll = Mock()
+    coordinator.needs_poll = Mock(return_value=True)
+    timer = Mock()
+    track = Mock(return_value=timer)
+    monkeypatch.setattr(module, "async_track_time_interval", track)
+
+    # Other models keep advertisement-driven polling and always-on readings.
+    coordinator._async_start()
+    track.assert_not_called()
+    assert coordinator.readings_available
+
+    device.state = DeviceInfo(64, "C-CB3AA", 20)
+    coordinator._async_start()
+    track.assert_called_once()
+    assert coordinator._on_stop == [timer]  # cancelled by every stop path
+    tick = track.call_args.args[1]
+    assert not coordinator.readings_available  # nothing received yet
+
+    tick(None)  # no advertisement seen yet: nothing to poll with
+    coordinator._debounced_poll.async_schedule_call.assert_not_called()
+    coordinator.async_update_listeners.assert_not_called()
+
+    coordinator._last_service_info = service
+    tick(None)
+    coordinator.needs_poll.assert_called_with(service)
+    coordinator._debounced_poll.async_schedule_call.assert_called_once()
+
+    coordinator._controller_updated(device.state, CallbackType.NOTIFICATION)
+    assert coordinator.readings_available
+    coordinator.async_update_listeners.assert_called_once()  # the frame itself
+    coordinator.needs_poll.return_value = False  # e.g. backing off
+    tick(None)
+    tick(None)
+    coordinator.async_update_listeners.assert_called_once()  # no change, no write
+
+    clock.return_value += module.STALE_READINGS
+    tick(None)
+    assert not coordinator.readings_available
+    assert coordinator.async_update_listeners.call_count == 2  # expired
+
+
+@pytest.mark.parametrize(("model", "polls"), [(64, False), (11, True)])
+def test_queued_poll_inside_backoff_is_skipped_for_cloudcom6_only(
+    integration,  # noqa: F811
+    monkeypatch,
+    model,
+    polls,
+):
+    async def exercise():
+        coordinator, device, clock, service = setup_polling(integration, monkeypatch)
+        device.state = replace(device.state, type=model, version=20)
+        # A slow connect fails; the backoff deadline is now in the future...
+        device.update.side_effect = TimeoutError
+        with pytest.raises(TimeoutError):
+            await coordinator._async_update(service)
+        assert coordinator._next_poll > clock.return_value
+        device.update.reset_mock(side_effect=True)
+        # ...and the call a tick queued meanwhile runs before it.
+        clock.return_value += 1
+        await coordinator._async_update(service)
+        assert (device.update.await_count > 0) is polls
+
+    asyncio.run(exercise())
+
+
+def test_cloudcom6_sensors_follow_reading_freshness(cc6, entities):  # noqa: F811
+    entry, _ = make_entry(64)
+    data = entry.runtime_data
+    data.device.state = DeviceInfo(64, "C-CB3AA", 20)
+    added = []
+    asyncio.run(entities["sensor"].async_setup_entry(None, entry, added.extend))
+    assert all(e.available for e in added)
+    data.coordinator.readings_available = False
+    assert not any(e.available for e in added)
+
+
+def test_other_models_get_no_probe_listener(entities):  # noqa: F811
+    entry, listeners = make_entry(11)
+    asyncio.run(entities["sensor"].async_setup_entry(None, entry, lambda e: None))
+    assert listeners == []
